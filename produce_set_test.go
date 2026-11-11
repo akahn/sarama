@@ -431,3 +431,33 @@ func TestProduceSetConsistentTimestamps(t *testing.T) {
 		t.Errorf("Message timestamps do not match: %v, %v", time1, time2)
 	}
 }
+
+func BenchmarkProduceSetAdd(b *testing.B) {
+	const (
+		numMessages   = 10_000
+		numPartitions = 4
+	)
+	value := make([]byte, 1024)
+	msgs := make([]*ProducerMessage, numMessages)
+	for i := range msgs {
+		msgs[i] = &ProducerMessage{
+			Topic:     "t1",
+			Partition: int32(i % numPartitions),
+			Value:     ByteEncoder(value),
+			Timestamp: time.Unix(1555718400, 0),
+		}
+	}
+
+	parent, _ := makeProduceSet()
+	parent.conf.Version = V2_0_0_0
+
+	b.ReportAllocs()
+	for b.Loop() {
+		ps := newProduceSet(parent)
+		for _, msg := range msgs {
+			if err := ps.add(msg); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
