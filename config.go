@@ -276,6 +276,17 @@ type Config struct {
 			MaxMessages int
 		}
 
+		// The maximum total byte size of messages the producer will hold, per
+		// broker, for a broker whose connection has stopped making progress
+		// (for example a broker that accepts connections but never responds).
+		// Once this limit is reached, further messages for that broker are
+		// failed immediately with ErrProducerBrokerBufferOverflow instead of
+		// blocking, which keeps messages flowing to the remaining healthy
+		// brokers. Defaults to 0, which preserves the historical behavior:
+		// the producer stops accepting input entirely (on all brokers) once
+		// one broker's accumulated batch is full.
+		MaxBrokerBufferBytes int64
+
 		Retry struct {
 			// The total number of times to retry sending a message (default 3).
 			// Similar to the `message.send.max.retries` setting of the JVM producer.
