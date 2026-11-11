@@ -2300,6 +2300,38 @@ func Test_partitionConsumer_parseResponseEmptyBatch(t *testing.T) {
 	}
 }
 
+func BenchmarkPartitionConsumerParseResponse(b *testing.B) {
+	const numRecords = 1000
+	value := ByteEncoder(bytes.Repeat([]byte{'v'}, 1024))
+	response := &FetchResponse{Version: 4}
+	for i := range numRecords {
+		response.AddRecord("my_topic", 0, nil, value, int64(i))
+	}
+	response.SetLastOffsetDelta("my_topic", 0, numRecords-1)
+	response.SetLastStableOffset("my_topic", 0, numRecords)
+	child := &partitionConsumer{
+		broker: &brokerConsumer{
+			broker: &Broker{},
+		},
+		conf:           NewTestConfig(),
+		topic:          "my_topic",
+		partition:      0,
+		dispatcherStop: make(chan none),
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		child.offset = 0
+		msgs, err := child.parseResponse(response)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(msgs) != numRecords {
+			b.Fatalf("expected %d messages, got %d", numRecords, len(msgs))
+		}
+	}
+}
+
 func testConsumerInterceptor(
 	t *testing.T,
 	interceptors []ConsumerInterceptor,
