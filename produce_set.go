@@ -12,17 +12,14 @@ type partitionSet struct {
 	bufferBytes   int
 
 	// records backs the *Record pointers held by recordsToSend.RecordBatch.
-	// Those pointers must stay valid, so a chunk is never appended past its
-	// capacity (which would reallocate it); a full chunk is replaced by a new
-	// one and the old one stays alive through the pointers into it.
+	// A full chunk is replaced rather than grown: growing would copy the
+	// Records on every doubling and keep each abandoned array alive through
+	// the pointers already handed out.
 	records []Record
 }
 
-// maxRecordChunk caps the size of each partitionSet.records chunk. Chunks
-// double up to this size so small batches do not pay for a large chunk. On
-// 64-bit platforms 146 Records plus the runtime's 8-byte malloc header fill a
-// 16 KiB size class with almost no waste; 128 would round up to 16 KiB with
-// 2 KiB unused per chunk.
+// maxRecordChunk is sized so one chunk (146 Records of 112 bytes each, plus
+// the runtime's 8-byte malloc header) exactly fills a 16 KiB size class.
 const maxRecordChunk = 146
 
 type produceSet struct {
