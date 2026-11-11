@@ -432,6 +432,31 @@ func TestProduceSetConsistentTimestamps(t *testing.T) {
 	}
 }
 
+// Records span several partitionSet.records chunks; each must keep pointing
+// at its own message after later chunks are allocated.
+func TestProduceSetRecordsAcrossChunks(t *testing.T) {
+	parent, ps := makeProduceSet()
+	parent.conf.Version = V0_11_0_0
+
+	const n = 3*maxRecordChunk + 1
+	for i := range n {
+		safeAddMessage(t, ps, &ProducerMessage{Topic: "t1", Partition: 0, Value: StringEncoder(fmt.Sprint(i))})
+	}
+
+	records := ps.buildRequest().records["t1"][0].RecordBatch.Records
+	if len(records) != n {
+		t.Fatalf("expected %d records, got %d", n, len(records))
+	}
+	for i, rec := range records {
+		if got, want := string(rec.Value), fmt.Sprint(i); got != want {
+			t.Fatalf("record %d: got value %q, want %q", i, got, want)
+		}
+		if rec.OffsetDelta != int64(i) {
+			t.Fatalf("record %d: got offset delta %d", i, rec.OffsetDelta)
+		}
+	}
+}
+
 func BenchmarkProduceSetAdd(b *testing.B) {
 	const (
 		numMessages   = 10_000
