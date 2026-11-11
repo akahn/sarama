@@ -860,6 +860,8 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 
 func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMessage, error) {
 	messages := make([]*ConsumerMessage, 0, len(batch.Records))
+	// allocate the messages in one slab rather than one at a time
+	slab := make([]ConsumerMessage, len(batch.Records))
 
 	for _, rec := range batch.Records {
 		offset := batch.FirstOffset + rec.OffsetDelta
@@ -870,7 +872,8 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 		if batch.LogAppendTime {
 			timestamp = batch.MaxTimestamp
 		}
-		messages = append(messages, &ConsumerMessage{
+		msg := &slab[len(messages)]
+		*msg = ConsumerMessage{
 			Topic:     child.topic,
 			Partition: child.partition,
 			Key:       rec.Key,
@@ -878,7 +881,8 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 			Offset:    offset,
 			Timestamp: timestamp,
 			Headers:   rec.Headers,
-		})
+		}
+		messages = append(messages, msg)
 		child.offset = offset + 1
 	}
 	if len(messages) == 0 {
