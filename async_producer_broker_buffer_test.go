@@ -114,13 +114,14 @@ func TestAsyncProducerStalledBrokerBlocksAllPartitions(t *testing.T) {
 
 	value := ByteEncoder(make([]byte, 4096))
 	accepted := 0
+sendLoop:
 	for i := 0; i < 10000; i++ {
 		msg := &ProducerMessage{Topic: "t", Partition: int32(i % 2), Value: value}
 		select {
 		case producer.Input() <- msg:
 			accepted++
 		case <-time.After(2 * time.Second):
-			i = 10000 // stalled, as expected with the limit disabled
+			break sendLoop // stalled, as expected with the limit disabled
 		}
 	}
 	if accepted == 10000 {
@@ -207,7 +208,103 @@ func TestAsyncProducerStalledBrokerShedsAndHealthyFlows(t *testing.T) {
 	t.Logf("healthy delivered %d/%d; shed %d; other errors %d",
 		healthyDelivered.Load(), total/2, overflowErrs.Load(), otherErrs.Load())
 
+	// Break the stalled conns first: shutdown's final flush would otherwise
+	// block on the dead socket until Net.WriteTimeout.
 	sick.close()
 	producer.AsyncClose()
 	drainWG.Wait()
+}
+
+// A retriable produce error that arrives while messages are parked exercises
+// drainOverflow's retry branch: parked messages must re-enter behind the
+// dropped-and-retried batch, preserving per-partition order end to end.
+func TestAsyncProducerParkedMessagesRetryInOrder(t *testing.T) {
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+	// Slow responses keep the first batch in flight while the burst below
+	// parks behind it.
+	broker.SetLatency(100 * time.Millisecond)
+
+	metadata := NewMockMetadataResponse(t).
+		SetBroker(broker.Addr(), broker.BrokerID()).
+		SetLeader("t", 0, broker.BrokerID())
+	notLeader := NewMockProduceResponse(t).SetError("t", 0, ErrNotLeaderForPartition)
+	produceOK := NewMockProduceResponse(t).SetError("t", 0, ErrNoError)
+	broker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": metadata,
+		"ProduceRequest":  NewMockSequence(notLeader, produceOK),
+	})
+
+	conf := NewConfig()
+	conf.Version = V2_1_0_0
+	conf.ApiVersionsRequest = false // MockBroker has no ApiVersions handler
+	conf.ChannelBufferSize = 8
+	conf.Producer.Partitioner = NewManualPartitioner
+	conf.Producer.Return.Successes = true
+	conf.Producer.Return.Errors = true
+	conf.Producer.Flush.Frequency = 10 * time.Millisecond
+	conf.Producer.MaxMessageBytes = 64 * 1024
+	conf.Producer.MaxBrokerBufferBytes = 16 * 1024 * 1024
+	producer, err := NewAsyncProducer([]string{broker.Addr()}, conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 300
+	var (
+		mu    sync.Mutex
+		order []int
+	)
+	var errCount atomic.Int64
+	var drainWG sync.WaitGroup
+	drainWG.Add(2)
+	go func() {
+		defer drainWG.Done()
+		for msg := range producer.Successes() {
+			mu.Lock()
+			order = append(order, msg.Metadata.(int))
+			mu.Unlock()
+		}
+	}()
+	go func() {
+		defer drainWG.Done()
+		for perr := range producer.Errors() {
+			errCount.Add(1)
+			t.Logf("unexpected error: %v", perr.Err)
+		}
+	}()
+
+	value := ByteEncoder(make([]byte, 4096))
+	for i := 0; i < total; i++ {
+		producer.Input() <- &ProducerMessage{Topic: "t", Partition: 0, Value: value, Metadata: i}
+	}
+
+	deadline := time.After(20 * time.Second)
+	for {
+		mu.Lock()
+		delivered := len(order)
+		mu.Unlock()
+		if delivered+int(errCount.Load()) >= total {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("stalled with %d of %d delivered", delivered, total)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	producer.AsyncClose()
+	drainWG.Wait()
+
+	if n := errCount.Load(); n != 0 {
+		t.Fatalf("expected no errors, got %d", n)
+	}
+	if len(order) != total {
+		t.Fatalf("expected %d successes, got %d", total, len(order))
+	}
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("out-of-order delivery at position %d: got message %d", i, got)
+		}
+	}
 }
