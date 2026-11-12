@@ -458,31 +458,32 @@ func TestProduceSetRecordsAcrossChunks(t *testing.T) {
 }
 
 func BenchmarkProduceSetAdd(b *testing.B) {
-	const (
-		numMessages   = 10_000
-		numPartitions = 4
-	)
+	const numPartitions = 4
 	value := make([]byte, 1024)
-	msgs := make([]*ProducerMessage, numMessages)
-	for i := range msgs {
-		msgs[i] = &ProducerMessage{
-			Topic:     "t1",
-			Partition: int32(i % numPartitions),
-			Value:     ByteEncoder(value),
-			Timestamp: time.Unix(1555718400, 0),
-		}
-	}
-
-	parent, _ := makeProduceSet()
-	parent.conf.Version = V2_0_0_0
-
-	b.ReportAllocs()
-	for b.Loop() {
-		ps := newProduceSet(parent)
-		for _, msg := range msgs {
-			if err := ps.add(msg); err != nil {
-				b.Fatal(err)
+	// Shapes from the doubling ramp's worst case (a couple of messages per
+	// partition) to full chunk amortization.
+	for _, perPartition := range []int{2, 16, 146, 2500} {
+		b.Run(fmt.Sprintf("per_partition_%d", perPartition), func(b *testing.B) {
+			msgs := make([]*ProducerMessage, perPartition*numPartitions)
+			for i := range msgs {
+				msgs[i] = &ProducerMessage{
+					Topic:     "t1",
+					Partition: int32(i % numPartitions),
+					Value:     ByteEncoder(value),
+					Timestamp: time.Unix(1555718400, 0),
+				}
 			}
-		}
+			parent, _ := makeProduceSet()
+			parent.conf.Version = V2_0_0_0
+			b.ReportAllocs()
+			for b.Loop() {
+				ps := newProduceSet(parent)
+				for _, msg := range msgs {
+					if err := ps.add(msg); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
 	}
 }
