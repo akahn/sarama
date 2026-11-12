@@ -860,7 +860,8 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 
 func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMessage, error) {
 	messages := make([]*ConsumerMessage, 0, len(batch.Records))
-	// allocate the messages in one slab rather than one at a time
+	// One allocation per batch instead of one per message: the GC then
+	// tracks a single object for the whole batch.
 	slab := make([]ConsumerMessage, len(batch.Records))
 
 	for _, rec := range batch.Records {
