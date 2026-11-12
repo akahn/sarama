@@ -431,3 +431,59 @@ func TestProduceSetConsistentTimestamps(t *testing.T) {
 		t.Errorf("Message timestamps do not match: %v, %v", time1, time2)
 	}
 }
+
+// Records span several partitionSet.records chunks; each must keep pointing
+// at its own message after later chunks are allocated.
+func TestProduceSetRecordsAcrossChunks(t *testing.T) {
+	parent, ps := makeProduceSet()
+	parent.conf.Version = V0_11_0_0
+
+	const n = 3*maxRecordChunk + 1
+	for i := range n {
+		safeAddMessage(t, ps, &ProducerMessage{Topic: "t1", Partition: 0, Value: StringEncoder(fmt.Sprint(i))})
+	}
+
+	records := ps.buildRequest().records["t1"][0].RecordBatch.Records
+	if len(records) != n {
+		t.Fatalf("expected %d records, got %d", n, len(records))
+	}
+	for i, rec := range records {
+		if got, want := string(rec.Value), fmt.Sprint(i); got != want {
+			t.Fatalf("record %d: got value %q, want %q", i, got, want)
+		}
+		if rec.OffsetDelta != int64(i) {
+			t.Fatalf("record %d: got offset delta %d", i, rec.OffsetDelta)
+		}
+	}
+}
+
+func BenchmarkProduceSetAdd(b *testing.B) {
+	const numPartitions = 4
+	value := make([]byte, 1024)
+	// Shapes from the doubling ramp's worst case (a couple of messages per
+	// partition) to full chunk amortization.
+	for _, perPartition := range []int{2, 16, 146, 2500} {
+		b.Run(fmt.Sprintf("per_partition_%d", perPartition), func(b *testing.B) {
+			msgs := make([]*ProducerMessage, perPartition*numPartitions)
+			for i := range msgs {
+				msgs[i] = &ProducerMessage{
+					Topic:     "t1",
+					Partition: int32(i % numPartitions),
+					Value:     ByteEncoder(value),
+					Timestamp: time.Unix(1555718400, 0),
+				}
+			}
+			parent, _ := makeProduceSet()
+			parent.conf.Version = V2_0_0_0
+			b.ReportAllocs()
+			for b.Loop() {
+				ps := newProduceSet(parent)
+				for _, msg := range msgs {
+					if err := ps.add(msg); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}

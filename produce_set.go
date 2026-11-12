@@ -10,7 +10,17 @@ type partitionSet struct {
 	msgs          []*ProducerMessage
 	recordsToSend Records
 	bufferBytes   int
+
+	// records backs the *Record pointers held by recordsToSend.RecordBatch.
+	// A full chunk is replaced rather than grown: growing would copy the
+	// Records on every doubling and keep each abandoned array alive through
+	// the pointers already handed out.
+	records []Record
 }
+
+// maxRecordChunk is sized so one chunk (146 Records of 112 bytes each, plus
+// the runtime's 8-byte malloc header) exactly fills a 16 KiB size class.
+const maxRecordChunk = 146
 
 type produceSet struct {
 	parent        *asyncProducer
@@ -105,11 +115,15 @@ func (ps *produceSet) add(msg *ProducerMessage) error {
 	if ps.parent.conf.Version.IsAtLeast(V0_11_0_0) {
 		// We are being conservative here to avoid having to prep encode the record
 		size += maximumRecordOverhead
-		rec := &Record{
+		if len(set.records) == cap(set.records) {
+			set.records = make([]Record, 0, min(len(set.msgs), maxRecordChunk))
+		}
+		set.records = append(set.records, Record{
 			Key:            key,
 			Value:          val,
 			TimestampDelta: timestamp.Sub(set.recordsToSend.RecordBatch.FirstTimestamp),
-		}
+		})
+		rec := &set.records[len(set.records)-1]
 		size += len(key) + len(val)
 		if len(msg.Headers) > 0 {
 			rec.Headers = make([]*RecordHeader, len(msg.Headers))
