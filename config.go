@@ -276,15 +276,15 @@ type Config struct {
 			MaxMessages int
 		}
 
-		// The maximum total byte size of messages the producer will hold, per
-		// broker, for a broker whose connection has stopped making progress
-		// (for example a broker that accepts connections but never responds).
-		// Once this limit is reached, further messages for that broker are
-		// failed immediately with ErrProducerBrokerBufferOverflow instead of
-		// blocking, which keeps messages flowing to the remaining healthy
-		// brokers. Defaults to 0, which preserves the historical behavior:
-		// the producer stops accepting input entirely (on all brokers) once
-		// one broker's accumulated batch is full.
+		// The maximum total byte size of messages the producer will park, per
+		// broker, while that broker's accumulated batch cannot flush (a
+		// stalled or slow broker). Beyond this limit, further messages for
+		// that broker fail immediately with ErrProducerBrokerBufferOverflow
+		// instead of blocking, so messages for other brokers keep flowing.
+		// This trades backpressure for shedding: under sustained overload of
+		// a healthy broker, messages the default configuration would block on
+		// are failed instead. Defaults to 0: the producer blocks, and one
+		// broker's full batch eventually stops input for all brokers.
 		MaxBrokerBufferBytes int64
 
 		Retry struct {

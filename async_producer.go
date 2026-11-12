@@ -19,8 +19,8 @@ import (
 // ErrProducerRetryBufferOverflow is returned when the bridging retry buffer is full and OOM prevention needs to be applied.
 var ErrProducerRetryBufferOverflow = errors.New("retry buffer full: message discarded to prevent buffer overflow")
 
-// ErrProducerBrokerBufferOverflow is returned when Producer.MaxBrokerBufferBytes is set and a
-// broker that has stopped making progress has accumulated that many bytes of pending messages.
+// ErrProducerBrokerBufferOverflow is returned when a broker's parked messages
+// would exceed Producer.MaxBrokerBufferBytes.
 var ErrProducerBrokerBufferOverflow = errors.New("broker buffer full: message discarded to avoid blocking the producer")
 
 const (
@@ -1119,10 +1119,9 @@ type brokerProducer struct {
 	timer             *time.Timer
 	timerFired        bool
 
-	// overflow parks messages that arrive while the accumulating batch is full,
-	// instead of stalling input (and with it every upstream dispatch stage, which
-	// would also stop traffic to healthy brokers). Only used when
-	// Producer.MaxBrokerBufferBytes is set; bounded by that limit via overflowBytes.
+	// overflow holds messages parked while the accumulating batch is full, in
+	// arrival order; overflowBytes tracks their total size against
+	// Producer.MaxBrokerBufferBytes.
 	overflow      queue.Queue[retryBufEntry]
 	overflowBytes int64
 
@@ -1135,6 +1134,9 @@ func (bp *brokerProducer) run() {
 	Logger.Printf("producer/broker/%d starting up\n", bp.broker.ID())
 
 	for {
+		// Runs after the previous iteration's response handling dropped and
+		// retried any same-partition messages from the accumulating batch, so
+		// parked messages re-enter behind them and retry order holds.
 		bp.drainOverflow()
 
 		var unmuteSignal <-chan struct{}
@@ -1198,10 +1200,10 @@ func (bp *brokerProducer) run() {
 			}
 
 			if maxBuf := bp.parent.conf.Producer.MaxBrokerBufferBytes; maxBuf > 0 {
-				// Park instead of blocking input, so a broker that stopped making
-				// progress cannot stall the upstream dispatch stages that also feed
-				// the healthy brokers. Once anything is parked, newer messages park
-				// behind it to preserve per-partition ordering.
+				// Park instead of blocking input, so one broker's full batch
+				// cannot stall the dispatch stages that also feed the other
+				// brokers. Once anything is parked, newer messages park behind
+				// it to preserve per-partition ordering.
 				if bp.overflow.Length() > 0 || (!bp.accumulatingBatch.empty() && bp.accumulatingBatch.wouldOverflow(msg)) {
 					size := int64(msg.ByteSize(bp.parent.messageVersion()))
 					if bp.overflowBytes+size > maxBuf {
@@ -1344,10 +1346,9 @@ func (bp *brokerProducer) needsRetry(msg *ProducerMessage) error {
 }
 
 // drainOverflow moves parked messages into the accumulating batch, in arrival
-// order, until the batch is full again. A parked message whose partition has
-// entered a retry state (or whose brokerProducer is closing) is handed to the
-// retry machinery instead: this runs after any same-partition messages already
-// in the accumulating batch were dropped and retried, so retry order holds.
+// order, until the batch is full. A parked message whose partition is in a
+// retry state (or whose brokerProducer is closing) is handed to the retry
+// machinery instead.
 func (bp *brokerProducer) drainOverflow() {
 	for bp.overflow.Length() > 0 {
 		entry := bp.overflow.Peek()
@@ -1725,7 +1726,8 @@ func (p *asyncProducer) retryHandler() {
 
 // utility functions
 
-// messageVersion is the record version used for ProducerMessage.ByteSize.
+// messageVersion returns the message format version implied by the configured
+// Kafka protocol version.
 func (p *asyncProducer) messageVersion() int {
 	if p.conf.Version.IsAtLeast(V0_11_0_0) {
 		return 2
