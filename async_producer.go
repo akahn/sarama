@@ -19,6 +19,10 @@ import (
 // ErrProducerRetryBufferOverflow is returned when the bridging retry buffer is full and OOM prevention needs to be applied.
 var ErrProducerRetryBufferOverflow = errors.New("retry buffer full: message discarded to prevent buffer overflow")
 
+// ErrProducerBrokerBufferOverflow is returned when a broker's parked messages
+// would exceed Producer.MaxBrokerBufferBytes.
+var ErrProducerBrokerBufferOverflow = errors.New("broker buffer full: message discarded to avoid blocking the producer")
+
 const (
 	// minFunctionalRetryBufferLength defines the minimum number of messages the retry buffer must support.
 	// If Producer.Retry.MaxBufferLength is set to a non-zero value below this limit, it will be adjusted to this value.
@@ -1115,6 +1119,12 @@ type brokerProducer struct {
 	timer             *time.Timer
 	timerFired        bool
 
+	// overflow holds messages parked while the accumulating batch is full, in
+	// arrival order; overflowBytes tracks their total size against
+	// Producer.MaxBrokerBufferBytes.
+	overflow      queue.Queue[retryBufEntry]
+	overflowBytes int64
+
 	closing        error
 	currentRetries map[string]map[int32]error
 }
@@ -1124,6 +1134,11 @@ func (bp *brokerProducer) run() {
 	Logger.Printf("producer/broker/%d starting up\n", bp.broker.ID())
 
 	for {
+		// Runs after the previous iteration's response handling dropped and
+		// retried any same-partition messages from the accumulating batch, so
+		// parked messages re-enter behind them and retry order holds.
+		bp.drainOverflow()
+
 		var unmuteSignal <-chan struct{}
 		if bp.flushingBatch == nil && (bp.timerFired || bp.accumulatingBatch.readyToFlush()) {
 			unmuteSignal = bp.tryBuildFlushingBatch()
@@ -1184,7 +1199,22 @@ func (bp *brokerProducer) run() {
 				continue
 			}
 
-			if bp.accumulatingBatch.wouldOverflow(msg) {
+			if maxBuf := bp.parent.conf.Producer.MaxBrokerBufferBytes; maxBuf > 0 {
+				// Park instead of blocking input, so one broker's full batch
+				// cannot stall the dispatch stages that also feed the other
+				// brokers. Once anything is parked, newer messages park behind
+				// it to preserve per-partition ordering.
+				if bp.overflow.Length() > 0 || (!bp.accumulatingBatch.empty() && bp.accumulatingBatch.wouldOverflow(msg)) {
+					size := int64(msg.ByteSize(bp.parent.messageVersion()))
+					if bp.overflowBytes+size > maxBuf {
+						bp.parent.returnError(msg, ErrProducerBrokerBufferOverflow)
+						continue
+					}
+					bp.overflow.Add(retryBufEntry{msg: msg, size: size})
+					bp.overflowBytes += size
+					continue
+				}
+			} else if bp.accumulatingBatch.wouldOverflow(msg) {
 				Logger.Printf("producer/broker/%d maximum request accumulated, waiting for space\n", bp.broker.ID())
 				if err := bp.waitForSpace(msg); err != nil {
 					bp.parent.retryMessage(msg, err)
@@ -1278,7 +1308,8 @@ func (bp *brokerProducer) shutdown() {
 		}
 	}
 	// then flush the current buffer
-	for !bp.accumulatingBatch.empty() || bp.flushingBatch != nil {
+	for !bp.accumulatingBatch.empty() || bp.flushingBatch != nil || bp.overflow.Length() > 0 {
+		bp.drainOverflow()
 		var unmuteSignal <-chan struct{}
 		if bp.flushingBatch == nil {
 			unmuteSignal = bp.tryBuildFlushingBatch()
@@ -1312,6 +1343,32 @@ func (bp *brokerProducer) needsRetry(msg *ProducerMessage) error {
 	}
 
 	return bp.currentRetries[msg.Topic][msg.Partition]
+}
+
+// drainOverflow moves parked messages into the accumulating batch, in arrival
+// order, until the batch is full. A parked message whose partition is in a
+// retry state (or whose brokerProducer is closing) is handed to the retry
+// machinery instead.
+func (bp *brokerProducer) drainOverflow() {
+	for bp.overflow.Length() > 0 {
+		entry := bp.overflow.Peek()
+		if reason := bp.needsRetry(entry.msg); reason != nil {
+			bp.overflowBytes -= bp.overflow.Remove().size
+			bp.parent.retryMessage(entry.msg, reason)
+			continue
+		}
+		if !bp.accumulatingBatch.empty() && bp.accumulatingBatch.wouldOverflow(entry.msg) {
+			return
+		}
+		bp.overflowBytes -= bp.overflow.Remove().size
+		if err := bp.accumulatingBatch.add(entry.msg); err != nil {
+			bp.parent.returnError(entry.msg, err)
+			continue
+		}
+		if bp.parent.conf.Producer.Flush.Frequency > 0 && bp.timer == nil {
+			bp.timer = time.NewTimer(bp.parent.conf.Producer.Flush.Frequency)
+		}
+	}
 }
 
 // waitForSpace makes space in the accumulating batch by flushing. It loops until the message fits.
@@ -1668,6 +1725,15 @@ func (p *asyncProducer) retryHandler() {
 }
 
 // utility functions
+
+// messageVersion returns the message format version implied by the configured
+// Kafka protocol version.
+func (p *asyncProducer) messageVersion() int {
+	if p.conf.Version.IsAtLeast(V0_11_0_0) {
+		return 2
+	}
+	return 1
+}
 
 func (p *asyncProducer) shutdown() {
 	Logger.Println("Producer shutting down.")
